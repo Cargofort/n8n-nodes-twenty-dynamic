@@ -5,6 +5,59 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.2] - 2026-10-21
+
+### Fixed - Twenty CRM v2.49 compatibility
+
+Every node execution failed against Twenty v2.49 with
+`Cannot query field "isCustom" on type "Object". Did you mean "isSystem"?`,
+because Twenty removed `isCustom` from the metadata `Object` and `Field` types
+(twentyhq/twenty #21228 and #21799).
+
+- The schema metadata query is now built from introspection of the metadata
+  `Object`, `Field` and `Workspace` types (one extra /metadata request), so it
+  only requests fields the connected server has. Servers that still expose
+  `isCustom` keep using it.
+- On servers without `isCustom`, custom objects are detected by comparing
+  `Object.applicationId` with the workspace custom application id, which is
+  read at runtime from `currentWorkspace { workspaceCustomApplicationId }` on
+  /metadata (falling back to `workspaceCustomApplication { id }`). Nothing is
+  hardcoded. If the lookup fails, objects are reported as standard instead of
+  failing the node. The Custom / Standard / System database groups and the
+  "(Custom Database)" / "(Standard Database)" labels keep working.
+- Field writability uses `isUIEditable` when available and only falls back to
+  the deprecated `isUIReadOnly` on older servers.
+- Field type mapping covers every v2.49 `FieldMetadataType` value
+  (SCREAMING_CASE metadata names such as FULL_NAME, LINKS, CURRENCY, ADDRESS
+  now get their dedicated inputs; ACTOR, FILES, MORPH_RELATION and TS_VECTOR
+  are no longer offered as plain text inputs).
+- Field dropdowns no longer offer MORPH_RELATION "head" fields (for example
+  `noteTarget.target`) that the v2.49 data API does not expose, and no longer
+  offer RELATION / MORPH_RELATION objects for Create, Update and Upsert (use the
+  `<name>Id` field instead).
+- Create / Update no longer select fields the object does not have (for
+  example `name` on Note), which Twenty rejected.
+- Upsert by field now filters on the server
+  (`?limit=1&filter=<field>[eq]:<value>`) instead of scanning only the first
+  page of records, which could create duplicates.
+- The credential test now calls the authenticated metadata API
+  (`currentWorkspace { id }`) instead of the public `/open-api/core` endpoint,
+  so an invalid API key no longer tests OK.
+
+### Credits
+
+The capability-detection approach, the field type map and the upsert filter
+were ported from
+[xangelix/n8n-nodes-twenty-crm-next](https://github.com/xangelix/n8n-nodes-twenty-crm-next)
+(v2.2.0). The workspace custom application lookup was changed to use /metadata,
+because on Twenty v2.49 `currentWorkspace` is not served by /graphql.
+
+### Breaking Changes
+None. The package name, node type (`n8n-nodes-twenty-dynamic.twenty`) and
+credential name are unchanged.
+
+---
+
 ## [0.9.32] - 2025-10-15
 
 ### 🐛 Bug Fix - Expression Validation for Link Fields

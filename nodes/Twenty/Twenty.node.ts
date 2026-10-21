@@ -21,6 +21,7 @@ import {
     getCleanFieldLabel,
 } from './TwentyApi.client';
 import { transformFieldsData, IFieldData } from './FieldTransformation';
+import { mapTwentyTypeToN8nType } from './fieldTypeMap';
 import { 
     executeUpsert,
     executeCreateMany,
@@ -1122,11 +1123,33 @@ export class Twenty implements INodeType {
                     // Convert map to array
                     const allFields = Array.from(fieldMap.values());
 
+                    // Names exposed by the /graphql data type (empty if introspection failed)
+                    const dataFieldNames = new Set(graphqlFields.map((field) => field.name));
+
                     // Filter fields based on operation and active status
                     const isCreateOrUpdate = operation === 'create' || operation === 'update';
+                    const isWriteOperation = isCreateOrUpdate || operation === 'upsert' || operation === 'upsertMany';
                     const filteredFields = allFields.filter((field) => {
                         // Always exclude deactivated fields (isActive: false)
                         if (field.isActive === false) {
+                            return false;
+                        }
+                        // Twenty v2.49 metadata returns MORPH_RELATION "head" fields (e.g. noteTarget.target)
+                        // that the /graphql data API does not expose; only keep them if the data type has them
+                        if (
+                            field.source === 'metadata' &&
+                            field.type === 'MORPH_RELATION' &&
+                            dataFieldNames.size > 0 &&
+                            !dataFieldNames.has(field.name)
+                        ) {
+                            return false;
+                        }
+                        // Relation objects cannot be written with a plain value (use the "<name>Id" field instead)
+                        if (
+                            isWriteOperation &&
+                            field.source === 'metadata' &&
+                            (field.type === 'RELATION' || field.type === 'MORPH_RELATION')
+                        ) {
                             return false;
                         }
                         // For Create/Update, only show writable fields
@@ -1137,28 +1160,8 @@ export class Twenty implements INodeType {
                         return true;
                     });
 
-                    // Helper: Map Twenty field type to n8n field type
-                    const mapTwentyTypeToN8nType = (twentyType: string): string => {
-                        const typeMap: Record<string, string> = {
-                            'SELECT': 'select',
-                            'MULTI_SELECT': 'multiSelect',
-                            'FullName': 'fullName',
-                            'Links': 'link',
-                            'Currency': 'currency',
-                            'Address': 'address',
-                            'EMAILS': 'emails',
-                            'PHONES': 'phones',
-                            'BOOLEAN': 'boolean',
-                            'TEXT': 'simple',
-                            'NUMBER': 'simple',
-                            'DATE_TIME': 'simple',
-                            'DATE': 'simple',
-                            'UUID': 'simple',
-                            'RAW_JSON': 'simple',
-                            'RELATION': 'relation',
-                        };
-                        return typeMap[twentyType] || 'simple';
-                    };
+                    // Twenty field type -> n8n field type mapping lives in fieldTypeMap.ts
+                    // (covers SCREAMING_CASE metadata enum values and GraphQL composite type names)
 
                     // Helper: Map GraphQL type to n8n field type (for built-in enums)
                     const mapGraphQLTypeToN8nType = (graphqlType: string): string => {

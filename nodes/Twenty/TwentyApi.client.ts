@@ -219,16 +219,156 @@ export async function twentyRestApiRequest<T>(
 }
 
 /**
- * Fetches the complete schema metadata from Twenty CRM.
- * Queries the /metadata endpoint to get all objects and their fields.
+ * Describes which optional fields the connected server's metadata GraphQL
+ * types expose. Twenty's metadata schema changes across versions:
+ * - `Object.isCustom` was removed in Twenty v2.x (twentyhq/twenty #21228, #21799);
+ *   custom objects are now identified by `Object.applicationId` matching the
+ *   workspace custom application id
+ * - `isUIReadOnly` is deprecated in favour of `isUIEditable`
+ * Introspecting the types first lets a single code path work against old and
+ * new Twenty versions instead of guessing queries and catching errors.
+ *
+ * Approach ported from xangelix/n8n-nodes-twenty-crm-next, with the workspace
+ * introspection and custom application lookup moved to the /metadata endpoint
+ * (on Twenty v2.49 `currentWorkspace` is only served by /metadata).
+ */
+interface IMetadataTypeCapabilities {
+	hasIsCustom: boolean;
+	hasApplicationId: boolean;
+	objectHasIsUIReadOnly: boolean;
+	objectHasIsUIEditable: boolean;
+	fieldHasIsUIReadOnly: boolean;
+	fieldHasIsUIEditable: boolean;
+	fieldHasOptions: boolean;
+	workspaceHasCustomApplicationId: boolean;
+	workspaceHasCustomApplication: boolean;
+}
+
+/**
+ * Capabilities assumed when type introspection is unavailable. They reproduce
+ * the query this package sent before capability detection existed (v2.1.1),
+ * so servers that worked before keep working.
+ */
+const LEGACY_METADATA_CAPABILITIES: IMetadataTypeCapabilities = {
+	hasIsCustom: true,
+	hasApplicationId: false,
+	objectHasIsUIReadOnly: true,
+	objectHasIsUIEditable: false,
+	fieldHasIsUIReadOnly: true,
+	fieldHasIsUIEditable: false,
+	fieldHasOptions: true,
+	workspaceHasCustomApplicationId: false,
+	workspaceHasCustomApplication: false,
+};
+
+/**
+ * Introspects the metadata GraphQL `Object`, `Field` and `Workspace` types in a
+ * single /metadata request to detect which optional fields the connected
+ * Twenty server supports.
  *
  * @param {TwentyApiContext} this The context object for the n8n function.
- * @returns {Promise<IObjectMetadata[]>} Array of object metadata.
+ * @returns {Promise<IMetadataTypeCapabilities>} Detected field capabilities.
  */
-export async function getSchemaMetadata(
+async function getMetadataTypeCapabilities(
 	this: TwentyApiContext,
-): Promise<IObjectMetadata[]> {
+): Promise<IMetadataTypeCapabilities> {
 	const query = `
+		query IntrospectMetadataTypes {
+			objectType: __type(name: "Object") {
+				fields {
+					name
+				}
+			}
+			fieldType: __type(name: "Field") {
+				fields {
+					name
+				}
+			}
+			workspaceType: __type(name: "Workspace") {
+				fields {
+					name
+				}
+			}
+		}
+	`;
+
+	let response: any;
+	try {
+		response = await twentyApiRequest.call(this, 'metadata', query);
+	} catch (error) {
+		// Introspection unavailable: fall back to the pre-detection query shape.
+		// Authentication/connection problems will surface on the objects query.
+		return LEGACY_METADATA_CAPABILITIES;
+	}
+
+	if (!response?.objectType?.fields) {
+		return LEGACY_METADATA_CAPABILITIES;
+	}
+
+	const toNameSet = (type: any): Set<string> =>
+		new Set<string>((type?.fields ?? []).map((field: any) => field.name as string));
+
+	const objectFieldNames = toNameSet(response.objectType);
+	const fieldFieldNames = toNameSet(response.fieldType);
+	const workspaceFieldNames = toNameSet(response.workspaceType);
+
+	return {
+		hasIsCustom: objectFieldNames.has('isCustom'),
+		hasApplicationId: objectFieldNames.has('applicationId'),
+		objectHasIsUIReadOnly: objectFieldNames.has('isUIReadOnly'),
+		objectHasIsUIEditable: objectFieldNames.has('isUIEditable'),
+		fieldHasIsUIReadOnly: fieldFieldNames.has('isUIReadOnly'),
+		fieldHasIsUIEditable: fieldFieldNames.has('isUIEditable'),
+		fieldHasOptions: fieldFieldNames.has('options'),
+		workspaceHasCustomApplicationId: workspaceFieldNames.has('workspaceCustomApplicationId'),
+		workspaceHasCustomApplication: workspaceFieldNames.has('workspaceCustomApplication'),
+	};
+}
+
+/**
+ * Builds the objects metadata query, requesting only the optional fields the
+ * connected server exposes (see getMetadataTypeCapabilities).
+ *
+ * Object and field editability prefer `isUIEditable` and only fall back to
+ * the deprecated `isUIReadOnly` on servers that lack it.
+ *
+ * @param {IMetadataTypeCapabilities} capabilities Detected field capabilities.
+ * @returns {string} The GraphQL query string.
+ */
+function buildObjectsQuery(capabilities: IMetadataTypeCapabilities): string {
+	const objectFlagFields = [
+		capabilities.hasIsCustom ? 'isCustom' : null,
+		capabilities.hasApplicationId ? 'applicationId' : null,
+		'isSystem',
+		'isActive',
+		'isRemote',
+		capabilities.objectHasIsUIEditable ? 'isUIEditable' : null,
+		!capabilities.objectHasIsUIEditable && capabilities.objectHasIsUIReadOnly
+			? 'isUIReadOnly'
+			: null,
+		'isSearchable',
+	]
+		.filter((field): field is string => field !== null)
+		.join('\n\t\t\t\t\t\t');
+
+	const fieldFlagFields = [
+		'id',
+		'name',
+		'label',
+		'type',
+		'isNullable',
+		capabilities.fieldHasIsUIEditable ? 'isUIEditable' : null,
+		!capabilities.fieldHasIsUIEditable && capabilities.fieldHasIsUIReadOnly
+			? 'isUIReadOnly'
+			: null,
+		'isActive',
+		'isSystem',
+		capabilities.fieldHasOptions ? 'options' : null,
+	]
+		.filter((field): field is string => field !== null)
+		.join('\n\t\t\t\t\t\t\t\t\t');
+
+	return `
 		query GetObjects {
 			objects(paging: { first: 200 }) {
 				edges {
@@ -238,24 +378,11 @@ export async function getSchemaMetadata(
 						namePlural
 						labelSingular
 						labelPlural
-						isCustom
-						isSystem
-						isActive
-						isRemote
-						isUIReadOnly
-						isSearchable
+						${objectFlagFields}
 						fields(paging: { first: 200 }, filter: {}) {
 							edges {
 								node {
-									id
-									name
-									label
-									type
-									isNullable
-									isUIReadOnly
-									isActive
-									isSystem
-									options
+									${fieldFlagFields}
 								}
 							}
 						}
@@ -264,11 +391,100 @@ export async function getSchemaMetadata(
 			}
 		}
 	`;
+}
 
-	const response: any = await twentyApiRequest.call(this, 'metadata', query);
+/**
+ * Discovers the id of the workspace's custom application at runtime.
+ * Objects created by users in the Twenty UI belong to this application, so
+ * `Object.applicationId === workspaceCustomApplicationId` identifies custom
+ * objects (same rule as Twenty's frontend getIsMetadataItemCustom).
+ *
+ * Queries /metadata (where `currentWorkspace` lives), preferring the scalar
+ * `workspaceCustomApplicationId` and falling back to
+ * `workspaceCustomApplication { id }`. Any failure returns null so a
+ * permissions or schema problem only degrades custom detection and never
+ * fails the schema fetch.
+ *
+ * @param {TwentyApiContext} this The context object for the n8n function.
+ * @param {IMetadataTypeCapabilities} capabilities Detected field capabilities.
+ * @returns {Promise<string | null>} The custom application id, or null if unavailable.
+ */
+async function getWorkspaceCustomApplicationId(
+	this: TwentyApiContext,
+	capabilities: IMetadataTypeCapabilities,
+): Promise<string | null> {
+	const candidates: Array<{ query: string; extract: (data: any) => unknown }> = [];
 
-	// Parse the GraphQL edges/node structure
-	const objects = response.objects.edges.map((edge: any) => {
+	if (capabilities.workspaceHasCustomApplicationId) {
+		candidates.push({
+			query: `
+				query GetWorkspaceCustomApplicationId {
+					currentWorkspace {
+						workspaceCustomApplicationId
+					}
+				}
+			`,
+			extract: (data) => data?.currentWorkspace?.workspaceCustomApplicationId,
+		});
+	}
+
+	if (capabilities.workspaceHasCustomApplication) {
+		candidates.push({
+			query: `
+				query GetWorkspaceCustomApplication {
+					currentWorkspace {
+						workspaceCustomApplication {
+							id
+						}
+					}
+				}
+			`,
+			extract: (data) => data?.currentWorkspace?.workspaceCustomApplication?.id,
+		});
+	}
+
+	for (const candidate of candidates) {
+		try {
+			const data: any = await twentyApiRequest.call(this, 'metadata', candidate.query);
+			const id = candidate.extract(data);
+			if (typeof id === 'string' && id !== '') {
+				return id;
+			}
+		} catch (error) {
+			// Try the next candidate; custom detection degrades to false if none work
+		}
+	}
+
+	return null;
+}
+
+/**
+ * Parses the GraphQL edges/node structure of an objects metadata response.
+ *
+ * @param {any} response The raw GraphQL response data.
+ * @param {IMetadataTypeCapabilities} capabilities Detected field capabilities.
+ * @param {(node: any) => boolean} resolveIsCustom Resolves whether an object is custom.
+ * @returns {IObjectMetadata[]} Array of object metadata.
+ */
+function parseObjectsResponse(
+	response: any,
+	capabilities: IMetadataTypeCapabilities,
+	resolveIsCustom: (node: any) => boolean,
+): IObjectMetadata[] {
+	const resolveIsWritable = (fieldNode: any): boolean => {
+		if (capabilities.fieldHasIsUIEditable) {
+			// Newer Twenty: isUIEditable (false = NOT writable, null/undefined = writable)
+			return fieldNode.isUIEditable !== false;
+		}
+		if (capabilities.fieldHasIsUIReadOnly) {
+			// Older Twenty: isUIReadOnly (true = NOT writable)
+			return fieldNode.isUIReadOnly !== true;
+		}
+		// Neither flag available: assume the field is writable
+		return true;
+	};
+
+	return (response?.objects?.edges ?? []).map((edge: any) => {
 		const node = edge.node;
 		return {
 			id: node.id,
@@ -276,22 +492,22 @@ export async function getSchemaMetadata(
 			namePlural: node.namePlural,
 			labelSingular: node.labelSingular,
 			labelPlural: node.labelPlural,
-			isCustom: node.isCustom,
+			isCustom: resolveIsCustom(node),
 			isSystem: node.isSystem,
 			isActive: node.isActive,
 			isRemote: node.isRemote,
-			isUIReadOnly: node.isUIReadOnly,
+			// Kept for compatibility; derived from isUIEditable on newer servers
+			isUIReadOnly: capabilities.objectHasIsUIEditable
+				? node.isUIEditable === false
+				: node.isUIReadOnly,
 			isSearchable: node.isSearchable,
-			fields: node.fields.edges.map((fieldEdge: any) => ({
+			fields: (node.fields?.edges ?? []).map((fieldEdge: any) => ({
 				id: fieldEdge.node.id,
 				name: fieldEdge.node.name,
 				label: fieldEdge.node.label,
 				type: fieldEdge.node.type,
 				isNullable: fieldEdge.node.isNullable,
-				// isWritable is the inverse of isUIReadOnly
-				// If isUIReadOnly is true, field is NOT writable
-				// If isUIReadOnly is false/null/undefined, field IS writable
-				isWritable: fieldEdge.node.isUIReadOnly !== true,
+				isWritable: resolveIsWritable(fieldEdge.node),
 				// Additional field metadata for debugging
 				isActive: fieldEdge.node.isActive,
 				isSystem: fieldEdge.node.isSystem,
@@ -302,10 +518,58 @@ export async function getSchemaMetadata(
 			})),
 		};
 	});
-
-	return objects;
 }
 
+/**
+ * Fetches the complete schema metadata from Twenty CRM.
+ * Queries the /metadata endpoint to get all objects and their fields.
+ *
+ * Adapts to the server's schema version via introspection:
+ * - Older Twenty exposes `isCustom` directly on the metadata Object type
+ * - Newer Twenty (v2.49+) removed `isCustom`; custom objects are detected by
+ *   matching each object's `applicationId` against the workspace custom
+ *   application id discovered at runtime
+ * - If neither mechanism is available, custom detection degrades to false
+ *   rather than failing the entire schema fetch
+ *
+ * @param {TwentyApiContext} this The context object for the n8n function.
+ * @returns {Promise<IObjectMetadata[]>} Array of object metadata.
+ */
+export async function getSchemaMetadata(
+	this: TwentyApiContext,
+): Promise<IObjectMetadata[]> {
+	// Detect which schema variant the connected server speaks
+	const capabilities = await getMetadataTypeCapabilities.call(this);
+
+	// applicationId-based detection needs the workspace custom application id
+	let workspaceCustomApplicationId: string | null = null;
+	if (!capabilities.hasIsCustom && capabilities.hasApplicationId) {
+		workspaceCustomApplicationId = await getWorkspaceCustomApplicationId.call(
+			this,
+			capabilities,
+		);
+	}
+
+	const response: any = await twentyApiRequest.call(
+		this,
+		'metadata',
+		buildObjectsQuery(capabilities),
+	);
+
+	return parseObjectsResponse(response, capabilities, (node) => {
+		// Older Twenty: direct isCustom flag
+		if (capabilities.hasIsCustom) {
+			return node.isCustom === true;
+		}
+		// Newer Twenty: custom objects belong to the workspace custom application
+		if (capabilities.hasApplicationId && workspaceCustomApplicationId !== null) {
+			return typeof node.applicationId === 'string' &&
+				node.applicationId === workspaceCustomApplicationId;
+		}
+		// Server exposes neither mechanism: custom detection unavailable
+		return false;
+	});
+}
 /**
  * Gets schema metadata with 10-minute TTL caching.
  * Checks credential data for cached schema and returns it if still valid.
@@ -782,6 +1046,50 @@ export async function buildComprehensiveFieldSelections(
 }
 
 /**
+ * Build the always-requested "essential" response fields for the local
+ * create/update mutation builders, without selecting fields the object does
+ * not have. Twenty rejects the whole document when a selection names a field
+ * that is missing on the type (e.g. `Cannot query field "name" on type "Note"`).
+ *
+ * When the metadata contains the object's standard fields (detected by the
+ * presence of `id`), only candidates that exist in the metadata are kept and
+ * `name` is expanded to `{ firstName lastName }` when it is a FULL_NAME field.
+ * Otherwise (older servers whose metadata lacks standard fields) the previous
+ * fixed selection is kept for backward compatibility.
+ *
+ * @param {string} objectNameSingular The singular name of the object
+ * @param {IObjectMetadata} objectMetadata The object metadata from schema
+ * @param {string[]} candidates Essential field names in the desired order
+ * @returns {string[]} Field selections
+ */
+function buildEssentialFieldSelections(
+	objectNameSingular: string,
+	objectMetadata: IObjectMetadata,
+	candidates: string[],
+): string[] {
+	const fullNameSelection = 'name {\n\t\t\t\t	firstName\n\t\t\t\t	lastName\n\t\t\t\t}';
+	const fieldsByName = new Map(objectMetadata.fields.map((field) => [field.name, field]));
+	const metadataHasStandardFields = fieldsByName.has('id');
+
+	if (!metadataHasStandardFields) {
+		// Legacy behaviour: fixed selection with Person/WorkspaceMember FullName handling
+		const complexNameObjects = ['person', 'workspaceMember', 'workspacemember'];
+		const isComplexName = complexNameObjects.includes(objectNameSingular.toLowerCase());
+		return candidates.map((candidate) =>
+			candidate === 'name' && isComplexName ? fullNameSelection : candidate,
+		);
+	}
+
+	return candidates
+		.filter((candidate) => fieldsByName.has(candidate))
+		.map((candidate) =>
+			candidate === 'name' && fieldsByName.get('name')?.type === 'FULL_NAME'
+				? fullNameSelection
+				: candidate,
+		);
+}
+
+/**
  * Build a GraphQL mutation for creating a record.
  * Only requests simple scalar fields in the response to avoid complex object subfield requirements.
  * 
@@ -808,15 +1116,15 @@ export function buildCreateMutation(
 		})
 		.map((field) => field.name);
 
-	// Handle complex name field for Person and WorkspaceMember
-	let nameField = 'name';
-	const complexNameObjects = ['person', 'workspaceMember', 'workspacemember'];
-	if (complexNameObjects.includes(objectNameSingular.toLowerCase())) {
-		nameField = 'name {\n\t\t\t\t	firstName\n\t\t\t\t	lastName\n\t\t\t\t}';
-	}
-
 	// Add essential fields that should always be requested but might be missing from metadata
-	const essentialFields = ['id', 'createdAt', 'updatedAt', 'deletedAt', nameField];
+	// (only those the object actually has, see buildEssentialFieldSelections)
+	const essentialFields = buildEssentialFieldSelections(objectNameSingular, objectMetadata, [
+		'id',
+		'createdAt',
+		'updatedAt',
+		'deletedAt',
+		'name',
+	]);
 
 	// Combine and deduplicate
 	const allFields = [...new Set([...essentialFields, ...metadataFields])];
@@ -929,15 +1237,17 @@ export function buildUpdateMutation(
 		})
 		.map((field) => field.name);
 
-	// Handle complex name field for Person and WorkspaceMember
-	let nameField = 'name';
-	const complexNameObjects = ['person', 'workspaceMember', 'workspacemember'];
-	if (complexNameObjects.includes(objectNameSingular.toLowerCase())) {
-		nameField = 'name {\n\t\t\t\t	firstName\n\t\t\t\t	lastName\n\t\t\t\t}';
-	}
-
 	// Add essential fields that should always be requested but might be missing from metadata
-	const essentialFields = ['id', 'createdAt', 'updatedAt', 'deletedAt', nameField, 'position', 'searchVector'];
+	// (only those the object actually has, see buildEssentialFieldSelections)
+	const essentialFields = buildEssentialFieldSelections(objectNameSingular, objectMetadata, [
+		'id',
+		'createdAt',
+		'updatedAt',
+		'deletedAt',
+		'name',
+		'position',
+		'searchVector',
+	]);
 
 	// Combine and deduplicate
 	const allFields = [...new Set([...essentialFields, ...metadataFields])];
