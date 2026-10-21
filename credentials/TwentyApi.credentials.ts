@@ -43,14 +43,16 @@ export class TwentyApi implements ICredentialType {
 	// /open-api/core is a public endpoint that answers 200 for any (or no) API key,
 	// so it cannot validate credentials. Query the authenticated metadata API instead:
 	// Twenty answers GraphQL auth failures with HTTP 200 and an `errors` array (no data),
-	// so the rule fails the test whenever no workspace id comes back.
+	// so the rule fails the test whenever no objects connection comes back.
+	// `objects` is used (not `currentWorkspace`) because it has been served by /metadata
+	// in every Twenty version; before v1.18 `currentWorkspace` lived on /graphql only.
 	test: ICredentialTestRequest = {
 		request: {
 			baseURL: '={{$credentials?.domain}}',
 			url: '/metadata',
 			method: 'POST',
 			body: {
-				query: 'query CredentialTest { currentWorkspace { id } }',
+				query: 'query CredentialTest { objects(paging: { first: 1 }) { edges { node { id } } } }',
 			},
 			json: true,
 		},
@@ -58,9 +60,9 @@ export class TwentyApi implements ICredentialType {
 			{
 				type: 'responseSuccessBody',
 				properties: {
-					key: 'data.currentWorkspace.id',
+					key: 'data.objects.edges',
 					value: undefined,
-					message: 'Twenty did not accept the API key (no workspace returned). Check the API key and domain.',
+					message: 'Twenty did not accept the API key (no metadata returned). Check the API key and domain.',
 				},
 			},
 		],

@@ -57,8 +57,26 @@ because Twenty removed `isCustom` from the metadata `Object` and `Field` types
   now fails the item instead of being treated as "no match" and creating a
   record.
 - The credential test now calls the authenticated metadata API
-  (`currentWorkspace { id }`) instead of the public `/open-api/core` endpoint,
-  so an invalid API key no longer tests OK.
+  (`objects(paging: { first: 1 })`, available on /metadata in every Twenty
+  version) instead of the public `/open-api/core` endpoint, so an invalid API
+  key no longer tests OK.
+
+### Upgrade notes - check before rollout
+
+Two intended changes turn silent duplicate creation into item failures:
+
+- An Upsert / Upsert Many node whose saved Match Field is a whole multi-sub-field
+  composite (person `name` / any FULL_NAME, CURRENCY or ADDRESS field) now fails
+  with "Re-select the match field". In 2.1.1 such a node compared the composite
+  object with a string, never matched, and created a record on every run.
+- An upsert lookup that fails for any reason other than 404 now fails the item
+  instead of creating a record.
+
+Before upgrading, list every workflow using this node with operation `upsert`
+or `upsertMany` and check its `upsertMatchField` / `upsertManyMatchField`
+value. Re-select any value that names a FULL_NAME, CURRENCY or ADDRESS field
+(for example `name|fullName`) as a sub-field (for example `name.lastName`).
+`emails|emails`, `phones|phones` and links values need no change.
 
 ### Credits
 
