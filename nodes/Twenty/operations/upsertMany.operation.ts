@@ -178,8 +178,15 @@ async function findRecordByField(
 			return { id: records[0].id };
 		}
 	} catch (error) {
-		// Error searching - return undefined (will trigger create)
-		return undefined;
+		// Only a 404 means "no match". Any other failure (invalid filter, 429, 5xx,
+		// network) is rethrown: treating it as "no match" would create a duplicate.
+		if (typeof error?.message === 'string' && error.message.startsWith('Record not found')) {
+			return undefined;
+		}
+		throw new NodeOperationError(
+			context.getNode(),
+			`Upsert lookup by "${matchField}" failed, no record was created or updated: ${error?.message ?? String(error)}`,
+		);
 	}
 
 	return undefined;

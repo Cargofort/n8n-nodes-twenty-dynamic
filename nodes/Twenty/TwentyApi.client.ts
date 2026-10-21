@@ -245,9 +245,9 @@ interface IMetadataTypeCapabilities {
 }
 
 /**
- * Capabilities assumed when type introspection is unavailable. They reproduce
- * the query this package sent before capability detection existed (v2.1.1),
- * so servers that worked before keep working.
+ * First fallback when type introspection is unavailable. It reproduces the
+ * query this package sent before capability detection existed (v2.1.1), so
+ * older servers that worked before keep working.
  */
 const LEGACY_METADATA_CAPABILITIES: IMetadataTypeCapabilities = {
 	hasIsCustom: true,
@@ -262,16 +262,58 @@ const LEGACY_METADATA_CAPABILITIES: IMetadataTypeCapabilities = {
 };
 
 /**
+ * Second fallback when type introspection is unavailable and the legacy query
+ * is rejected because the server no longer has `isCustom` (Twenty v2.49+).
+ * Every field it selects exists in the Twenty v2.49.0 metadata schema;
+ * `isUIReadOnly` is not used because it is deprecated there.
+ */
+const MODERN_METADATA_CAPABILITIES: IMetadataTypeCapabilities = {
+	hasIsCustom: false,
+	hasApplicationId: true,
+	objectHasIsUIReadOnly: false,
+	objectHasIsUIEditable: true,
+	fieldHasIsUIReadOnly: false,
+	fieldHasIsUIEditable: true,
+	fieldHasOptions: true,
+	workspaceHasCustomApplicationId: true,
+	workspaceHasCustomApplication: true,
+};
+
+/**
+ * Returns true if an error from a metadata request is a GraphQL validation
+ * error about a field the server does not have (e.g. `Cannot query field
+ * "isCustom" on type "Object"`). Depending on the server, the message is in
+ * the error message, the NodeApiError description, or the response body.
+ *
+ * @param {any} error The caught error.
+ * @param {string} fieldName The field name to look for.
+ * @returns {boolean} Whether the error reports the field as unknown.
+ */
+function isUnknownFieldError(error: any, fieldName: string): boolean {
+	const needle = `Cannot query field "${fieldName}"`;
+	const texts: string[] = [];
+	if (typeof error?.message === 'string') texts.push(error.message);
+	if (typeof error?.description === 'string') texts.push(error.description);
+	try {
+		texts.push(JSON.stringify(error?.cause ?? error?.context ?? '') ?? '');
+	} catch {
+		// Circular structure: ignore, message and description were checked
+	}
+	return texts.some((text) => text.includes(needle) || text.includes(needle.replace(/"/g, '\\"')));
+}
+
+/**
  * Introspects the metadata GraphQL `Object`, `Field` and `Workspace` types in a
  * single /metadata request to detect which optional fields the connected
  * Twenty server supports.
  *
  * @param {TwentyApiContext} this The context object for the n8n function.
- * @returns {Promise<IMetadataTypeCapabilities>} Detected field capabilities.
+ * @returns {Promise<IMetadataTypeCapabilities | null>} Detected field capabilities,
+ *   or null if introspection failed (the caller then probes with fallback queries).
  */
 async function getMetadataTypeCapabilities(
 	this: TwentyApiContext,
-): Promise<IMetadataTypeCapabilities> {
+): Promise<IMetadataTypeCapabilities | null> {
 	const query = `
 		query IntrospectMetadataTypes {
 			objectType: __type(name: "Object") {
@@ -296,13 +338,13 @@ async function getMetadataTypeCapabilities(
 	try {
 		response = await twentyApiRequest.call(this, 'metadata', query);
 	} catch (error) {
-		// Introspection unavailable: fall back to the pre-detection query shape.
-		// Authentication/connection problems will surface on the objects query.
-		return LEGACY_METADATA_CAPABILITIES;
+		// Introspection unavailable (or a transient failure): the caller probes
+		// with fallback queries, and real connection/auth errors surface there.
+		return null;
 	}
 
 	if (!response?.objectType?.fields) {
-		return LEGACY_METADATA_CAPABILITIES;
+		return null;
 	}
 
 	const toNameSet = (type: any): Set<string> =>
@@ -539,7 +581,32 @@ export async function getSchemaMetadata(
 	this: TwentyApiContext,
 ): Promise<IObjectMetadata[]> {
 	// Detect which schema variant the connected server speaks
-	const capabilities = await getMetadataTypeCapabilities.call(this);
+	const detected = await getMetadataTypeCapabilities.call(this);
+
+	let capabilities: IMetadataTypeCapabilities;
+	let response: any;
+
+	if (detected !== null) {
+		capabilities = detected;
+	} else {
+		// Introspection failed: try the v2.1.1 query (older servers). If the server
+		// rejects it because isCustom no longer exists (Twenty v2.49+), retry with a
+		// query that only selects v2.49 fields. Any other error (timeout, 5xx,
+		// auth) is rethrown as-is so the real cause is reported.
+		try {
+			response = await twentyApiRequest.call(
+				this,
+				'metadata',
+				buildObjectsQuery(LEGACY_METADATA_CAPABILITIES),
+			);
+			capabilities = LEGACY_METADATA_CAPABILITIES;
+		} catch (error) {
+			if (!isUnknownFieldError(error, 'isCustom')) {
+				throw error;
+			}
+			capabilities = MODERN_METADATA_CAPABILITIES;
+		}
+	}
 
 	// applicationId-based detection needs the workspace custom application id
 	let workspaceCustomApplicationId: string | null = null;
@@ -550,11 +617,13 @@ export async function getSchemaMetadata(
 		);
 	}
 
-	const response: any = await twentyApiRequest.call(
-		this,
-		'metadata',
-		buildObjectsQuery(capabilities),
-	);
+	if (response === undefined) {
+		response = await twentyApiRequest.call(
+			this,
+			'metadata',
+			buildObjectsQuery(capabilities),
+		);
+	}
 
 	return parseObjectsResponse(response, capabilities, (node) => {
 		// Older Twenty: direct isCustom flag

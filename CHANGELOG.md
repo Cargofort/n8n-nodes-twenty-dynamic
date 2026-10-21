@@ -17,7 +17,10 @@ because Twenty removed `isCustom` from the metadata `Object` and `Field` types
 - The schema metadata query is now built from introspection of the metadata
   `Object`, `Field` and `Workspace` types (one extra /metadata request), so it
   only requests fields the connected server has. Servers that still expose
-  `isCustom` keep using it.
+  `isCustom` keep using it. If the introspection request fails, the node tries
+  the v2.1.1 query and, if the server rejects `isCustom`, retries with a query
+  that only selects v2.49 fields; any other error (timeout, 5xx, auth) is
+  reported as-is instead of being masked.
 - On servers without `isCustom`, custom objects are detected by comparing
   `Object.applicationId` with the workspace custom application id, which is
   read at runtime from `currentWorkspace { workspaceCustomApplicationId }` on
@@ -40,14 +43,27 @@ because Twenty removed `isCustom` from the metadata `Object` and `Field` types
 - Upsert by field now filters on the server
   (`?limit=1&filter=<field>[eq]:<value>`) instead of scanning only the first
   page of records, which could create duplicates.
+- The Upsert / Upsert Many "Match Field" dropdowns expand composite fields
+  into filterable sub-field paths (`emails.primaryEmail`,
+  `phones.primaryPhoneNumber`, `domainName.primaryLinkUrl`,
+  `name.firstName` / `name.lastName`, currency and address sub-fields) and no
+  longer offer relations, multi-selects, JSON, arrays or rich text. Twenty
+  rejects a filter on a whole composite object, so the old `emails` choice
+  never matched and every run created a duplicate. Workflows saved with a
+  single-sub-field composite (emails, phones, links) are mapped to that
+  sub-field at run time; ones saved with a multi-sub-field composite (full
+  name, currency, address) fail with a message asking to re-select the field.
+- An upsert lookup error other than 404 (invalid filter, 429, 5xx, network)
+  now fails the item instead of being treated as "no match" and creating a
+  record.
 - The credential test now calls the authenticated metadata API
   (`currentWorkspace { id }`) instead of the public `/open-api/core` endpoint,
   so an invalid API key no longer tests OK.
 
 ### Credits
 
-The capability-detection approach, the field type map and the upsert filter
-were ported from
+The capability-detection approach, the field type map, the upsert filter and
+the composite match sub-fields (from its 2.1.5) were ported from
 [xangelix/n8n-nodes-twenty-crm-next](https://github.com/xangelix/n8n-nodes-twenty-crm-next)
 (v2.2.0). The workspace custom application lookup was changed to use /metadata,
 because on Twenty v2.49 `currentWorkspace` is not served by /graphql.

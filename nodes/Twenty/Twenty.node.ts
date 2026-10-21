@@ -21,7 +21,12 @@ import {
     getCleanFieldLabel,
 } from './TwentyApi.client';
 import { transformFieldsData, IFieldData } from './FieldTransformation';
-import { mapTwentyTypeToN8nType } from './fieldTypeMap';
+import {
+    COMPOUND_MATCH_SUB_FIELDS,
+    NON_MATCHABLE_FIELD_TYPES,
+    mapTwentyTypeToN8nType,
+    resolveMatchFieldPath,
+} from './fieldTypeMap';
 import { 
     executeUpsert,
     executeCreateMany,
@@ -482,7 +487,7 @@ export class Twenty implements INodeType {
                 name: 'upsertMatchField',
                 type: 'options',
                 typeOptions: {
-                    loadOptionsMethod: 'getFieldsForResource',
+                    loadOptionsMethod: 'getMatchFieldsForResource',
                 },
                 displayOptions: {
                     show: {
@@ -536,7 +541,7 @@ export class Twenty implements INodeType {
                 name: 'upsertManyMatchField',
                 type: 'options',
                 typeOptions: {
-                    loadOptionsMethod: 'getFieldsForResource',
+                    loadOptionsMethod: 'getMatchFieldsForResource',
                 },
                 displayOptions: {
                     show: {
@@ -1220,6 +1225,95 @@ export class Twenty implements INodeType {
             },
 
             /**
+             * Get matchable fields for the Upsert "Match Field" dropdowns.
+             * Same dual-source fields as getFieldsForResource, but composite fields are
+             * expanded into their filterable sub-field paths (e.g. Emails becomes
+             * emails.primaryEmail), because Twenty's REST filter rejects a filter on a
+             * whole composite object. Relations, JSON, arrays and rich text are left out.
+             * Ported from xangelix/n8n-nodes-twenty-crm-next (2.1.5).
+             */
+            async getMatchFieldsForResource(this: ILoadOptionsFunctions): Promise<INodePropertyOptions[]> {
+                try {
+                    const resource = this.getCurrentNodeParameter('resource') as string;
+                    if (!resource) {
+                        return [];
+                    }
+
+                    const schema = await getCachedSchema.call(this, false);
+                    const objectMeta = schema.objects.find((obj) => obj.nameSingular === resource);
+                    const metadataFields: IFieldMetadata[] = objectMeta?.fields || [];
+                    const graphqlFields: IFieldMetadata[] = await getDataSchemaForObject.call(this, resource);
+                    const dataFieldNames = new Set(graphqlFields.map((field) => field.name));
+
+                    const fieldMap = new Map<string, IFieldMetadata>();
+                    graphqlFields.forEach((field) => fieldMap.set(field.name, { ...field, source: 'graphql' }));
+                    metadataFields.forEach((field) => fieldMap.set(field.name, { ...field, source: 'metadata' }));
+
+                    // Scalar types the /graphql introspection reports for fields missing from metadata
+                    const graphqlScalarTypes = new Set(['TEXT', 'NUMBER', 'BOOLEAN', 'UUID', 'DATE_TIME', 'DATE', 'TIME']);
+
+                    const options: INodePropertyOptions[] = [];
+                    for (const field of fieldMap.values()) {
+                        if (field.isActive === false || NON_MATCHABLE_FIELD_TYPES.has(field.type)) {
+                            continue;
+                        }
+                        // MORPH_RELATION heads missing from the data API (see getFieldsForResource)
+                        if (
+                            field.source === 'metadata' &&
+                            field.type === 'MORPH_RELATION' &&
+                            dataFieldNames.size > 0 &&
+                            !dataFieldNames.has(field.name)
+                        ) {
+                            continue;
+                        }
+
+                        let n8nType: string;
+                        if (field.source === 'metadata') {
+                            n8nType = mapTwentyTypeToN8nType(field.type);
+                        } else if (field.relationMetadata || field.type.startsWith('LIST<')) {
+                            continue;
+                        } else if (field.type.includes('Enum')) {
+                            n8nType = 'select';
+                        } else if (graphqlScalarTypes.has(field.type) || COMPOUND_MATCH_SUB_FIELDS[mapTwentyTypeToN8nType(field.type)]) {
+                            n8nType = mapTwentyTypeToN8nType(field.type);
+                        } else {
+                            continue;
+                        }
+
+                        // Relations and multi-selects cannot be matched with an eq filter
+                        if (n8nType === 'relation' || n8nType === 'multiSelect') {
+                            continue;
+                        }
+
+                        const label = getCleanFieldLabel(field.label, field.name);
+                        const subFields = COMPOUND_MATCH_SUB_FIELDS[n8nType];
+                        if (subFields) {
+                            for (const { subField, label: subLabel } of subFields) {
+                                options.push({
+                                    name: `${label} › ${subLabel}`,
+                                    value: `${field.name}.${subField}`,
+                                    description: field.type,
+                                });
+                            }
+                            continue;
+                        }
+
+                        options.push({
+                            name: label,
+                            value: `${field.name}|${n8nType}`,
+                            description: field.type,
+                        });
+                    }
+
+                    options.sort((a, b) => a.name.localeCompare(b.name));
+
+                    return options;
+                } catch (error) {
+                    throw new NodeOperationError(this.getNode(), `Failed to load match fields for resource: ${error.message}`);
+                }
+            },
+
+            /**
              * Get sortable fields for the Order By dropdown in List/Search operation.
              * Uses dual-source architecture (metadata + GraphQL introspection) for full field coverage.
              * Filters to only include scalar/sortable field types.
@@ -1795,8 +1889,14 @@ export class Twenty implements INodeType {
                     } else {
                         const matchFieldParam = this.getNodeParameter('upsertMatchField', i) as string;
                         const matchValue = this.getNodeParameter('upsertMatchValue', i) as string;
-                        // Extract field name from pipe-separated value (fieldName|fieldType)
-                        options.matchField = matchFieldParam.split('|')[0];
+                        // Stored value is fieldName|fieldType or a composite sub-field path
+                        // (emails.primaryEmail); composite parents saved by older versions are
+                        // mapped to a sub-field path because Twenty rejects them as filters
+                        const resolvedMatch = resolveMatchFieldPath(matchFieldParam, objectMetadata.fields || []);
+                        if ('error' in resolvedMatch) {
+                            throw new NodeOperationError(this.getNode(), resolvedMatch.error, { itemIndex: i });
+                        }
+                        options.matchField = resolvedMatch.path;
                         options.matchValue = matchValue;
                     }
 
@@ -1824,7 +1924,11 @@ export class Twenty implements INodeType {
                     }
 
                     const matchFieldParam = this.getNodeParameter('upsertManyMatchField', i) as string;
-                    const matchField = matchFieldParam.split('|')[0];
+                    const resolvedMatch = resolveMatchFieldPath(matchFieldParam, objectMetadata.fields || []);
+                    if ('error' in resolvedMatch) {
+                        throw new NodeOperationError(this.getNode(), resolvedMatch.error, { itemIndex: i });
+                    }
+                    const matchField = resolvedMatch.path;
 
                     // Transform each upsert's fields
                     const transformedUpserts = upsertData.map(item => ({
