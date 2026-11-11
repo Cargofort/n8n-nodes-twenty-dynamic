@@ -5,6 +5,49 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.3] - 2026-11-10
+
+### Checked - Twenty CRM v2.57.1 compatibility
+
+The requests this node sends were compared with the Twenty v2.57.1 source
+(against v2.49.0, the version 2.1.2 was written for). Nothing the node uses was
+removed or renamed:
+
+- Metadata API: every `Object`, `Field` and `Workspace` field the schema query
+  selects still exists (`applicationId`, `isUIEditable`,
+  `workspaceCustomApplicationId`, ...). The `FieldMetadataType` enum has the
+  same 25 values.
+- REST API: paths, `limit`, `order_by`, `starting_after` and the response shape
+  are unchanged. The filter parser is now quote-aware (brackets inside a
+  quoted value are no longer counted), which needs no change in the filters
+  the node builds.
+- Rich text is the one schema change: `blocknote` is deprecated and `tiptap`
+  was added (v2.51). See below.
+
+### Fixed
+
+- Rich text fields (for example the `bodyV2` body of a Note or Task) can be
+  written. They now get a multi-line "Markdown" input and are sent as
+  `{ markdown }`; Twenty derives the other formats. Before, the value was sent
+  as a plain string, which Twenty rejects. A node saved with the old plain
+  "Value" input for such a field, and a rich text value in a Create Many /
+  Update Many / Upsert Many JSON payload, are wrapped the same way; an object
+  (`{ markdown }`, `{ tiptap }`) is passed through unchanged.
+- The bulk and upsert operations return rich text fields as
+  `{ markdown }`. `blocknote` is not requested because it is deprecated, and
+  `tiptap` is not requested because servers before v2.51 do not have it.
+- List/Search returns up to the requested Limit. Twenty caps a page at 200
+  records without an error, so a Limit above 200 used to return 200 records;
+  the node now follows the cursor (`starting_after`). A Limit of 200 or less
+  sends the same single request as before.
+- `pnpm install --frozen-lockfile` works again (the lockfile still listed a
+  `dotenv` dependency that package.json no longer has).
+
+### Breaking Changes
+None.
+
+---
+
 ## [2.1.2] - 2026-10-21
 
 ### Fixed - Twenty CRM v2.49 compatibility

@@ -51,6 +51,10 @@ const COMPLEX_TYPE_SUBFIELDS: Record<string, string> = {
 		primaryPhoneCountryCode
 		primaryPhoneCallingCode
 		additionalPhones`,
+	// Only `markdown`: `blocknote` is deprecated since Twenty v2.51 and `tiptap`
+	// does not exist before it, while `markdown` is served by every version.
+	'RichText': `markdown`,
+	'RichTextV2': `markdown`,
 };
 
 /**

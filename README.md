@@ -265,7 +265,7 @@ Please report bugs and request features on [GitHub Issues](https://github.com/Lo
 
 ## Compatibility
 
-Compatible and tested with the newest Twenty v1.11.0 and n8n Version 2.0 Beta (Last Updated: 2025-12-15)
+Compatible with Twenty v2.49 to v2.57.1; the API calls the node makes were checked against the Twenty v2.57.1 source (Last Updated: 2026-11-10). Older Twenty versions keep working through the metadata capability detection added in 2.1.2.
 
 
 ## Credits

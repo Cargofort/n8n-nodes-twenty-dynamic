@@ -25,6 +25,7 @@ import {
     COMPOUND_MATCH_SUB_FIELDS,
     NON_MATCHABLE_FIELD_TYPES,
     mapTwentyTypeToN8nType,
+    getRichTextMetadataTypes,
     resolveMatchFieldPath,
 } from './fieldTypeMap';
 import { 
@@ -35,6 +36,13 @@ import {
     executeDeleteMany,
     executeUpsertMany,
 } from './operations';
+
+/**
+ * Largest page Twenty's REST API returns for a list request (QUERY_MAX_RECORDS
+ * in twenty-shared, 200 in Twenty v2.49 - v2.57). A larger `limit` is clamped
+ * by the server without an error, so List/Search follows the cursor instead.
+ */
+const TWENTY_REST_MAX_PAGE_SIZE = 200;
 
 /**
  * Smart filter builder for the List/Search operation.
@@ -629,6 +637,23 @@ export class Twenty implements INodeType {
                                 description: 'The value to set for this field',
                                 placeholder: 'Enter value',
                             },
+                            // Rich text field (e.g. the body of a Note or Task)
+                            {
+                                displayName: 'Markdown',
+                                name: 'fieldMarkdownValue',
+                                type: 'string',
+                                typeOptions: {
+                                    rows: 4,
+                                },
+                                displayOptions: {
+                                    show: {
+                                        fieldType: ['richText'],
+                                    },
+                                },
+                                default: '',
+                                description: 'The content in Markdown format',
+                                placeholder: 'e.g. ## Heading',
+                            },
                             // Full Name fields  
                             {
                                 displayName: 'First Name',
@@ -1182,11 +1207,18 @@ export class Twenty implements INodeType {
                         return mapTwentyTypeToN8nType(graphqlType);
                     };
 
+                    // Before Twenty v1.19, RICH_TEXT was a plain text type (the composite was RICH_TEXT_V2)
+                    const richTextMetadataTypes = getRichTextMetadataTypes(schema.objects);
+                    const mapMetadataTypeToN8nType = (metadataType: string): string =>
+                        metadataType === 'RICH_TEXT' && !richTextMetadataTypes.has('RICH_TEXT')
+                            ? 'simple'
+                            : mapTwentyTypeToN8nType(metadataType);
+
                     // Transform to dropdown options with pipe-separated values (fieldName|fieldType)
                     const options: INodePropertyOptions[] = filteredFields.map((field) => {
                         // Determine n8n field type
                         const n8nType = field.source === 'metadata' 
-                            ? mapTwentyTypeToN8nType(field.type)
+                            ? mapMetadataTypeToN8nType(field.type)
                             : mapGraphQLTypeToN8nType(field.type);
 
                         return {
@@ -1633,6 +1665,16 @@ export class Twenty implements INodeType {
             throw new NodeOperationError(this.getNode(), `Object "${resource}" not found in schema`);
         }
 
+        // Rich text fields need { markdown } instead of a plain string (see transformFieldsData)
+        const richTextMetadataTypes = getRichTextMetadataTypes(schema.objects);
+        const transformOptions = {
+            richTextFieldNames: new Set(
+                objectMetadata.fields
+                    .filter((field) => richTextMetadataTypes.has(field.type))
+                    .map((field) => field.name),
+            ),
+        };
+
         for (let i = 0; i < items.length; i++) {
             try {
                 if (operation === 'create') {
@@ -1643,7 +1685,7 @@ export class Twenty implements INodeType {
 
                     // Transform fields array to data object using modular transformation
                     // Pass resource to handle resource-specific transformations (e.g., Person.name is FullName, Company.name is String)
-                    const fieldsData = transformFieldsData(fieldsParam.field || [], resource);
+                    const fieldsData = transformFieldsData(fieldsParam.field || [], resource, transformOptions);
 
                     // Build and execute create mutation (using introspection for comprehensive field discovery)
                     const { query, variables } = await buildCreateMutation.call(
@@ -1683,6 +1725,7 @@ export class Twenty implements INodeType {
                             fieldValue: value,
                         })),
                         resource,
+                        transformOptions,
                     ));
 
                     // Execute bulk create
@@ -1814,7 +1857,7 @@ export class Twenty implements INodeType {
 
                     // Transform fields array to data object (partial update) using modular transformation
                     // Pass resource to handle resource-specific transformations (e.g., Person.name is FullName, Company.name is String)
-                    const fieldsData = transformFieldsData(fieldsParam.field || [], resource);
+                    const fieldsData = transformFieldsData(fieldsParam.field || [], resource, transformOptions);
 
                     // Build and execute update mutation (using introspection for comprehensive field discovery)
                     const { query, variables } = await buildUpdateMutation.call(
@@ -1857,6 +1900,7 @@ export class Twenty implements INodeType {
                                 fieldValue: value,
                             })),
                             resource,
+                            transformOptions,
                         ),
                     }));
 
@@ -1879,7 +1923,7 @@ export class Twenty implements INodeType {
                     };
 
                     // Transform fields array to data object using modular transformation
-                    const fieldsData = transformFieldsData(fieldsParam.field || [], resource);
+                    const fieldsData = transformFieldsData(fieldsParam.field || [], resource, transformOptions);
 
                     // Prepare options based on upsert mode
                     const options: any = {};
@@ -1939,6 +1983,7 @@ export class Twenty implements INodeType {
                                 fieldValue: value,
                             })),
                             resource,
+                            transformOptions,
                         ),
                     }));
 
@@ -2067,49 +2112,68 @@ export class Twenty implements INodeType {
                     // Use REST API for List/Search operation - returns all fields automatically
                     const pluralName = objectMetadata.namePlural;
 
-                    // Build query parameters for REST API
-                    const queryParts: string[] = [];
-                    if (limit) {
-                        queryParts.push(`limit=${limit}`);
-                    }
+                    // Build the query parameters shared by every page
+                    const baseQueryParts: string[] = [];
                     if (searchQuery) {
                         // Use smart filter builder to auto-detect plain text vs advanced syntax
                         const filter = buildSmartFilter(searchQuery, resource);
                         // URL-encode the filter value - Twenty REST API requires encoded filter params
                         // Without encoding, % wildcards in ilike get interpreted as URL percent-encoding
-                        queryParts.push(`filter=${encodeURIComponent(filter)}`);
+                        baseQueryParts.push(`filter=${encodeURIComponent(filter)}`);
                     }
                     if (orderByField) {
-                        queryParts.push(`order_by=${orderByField}[${orderByDirection}]`);
+                        baseQueryParts.push(`order_by=${orderByField}[${orderByDirection}]`);
                     }
 
-                    const restPath = `/${pluralName}${queryParts.length > 0 ? '?' + queryParts.join('&') : ''}`;
-                    
                     try {
-                        const response: any = await twentyRestApiRequest.call(
-                            this,
-                            'GET',
-                            restPath,
-                        );
+                        // Twenty silently caps a page at TWENTY_REST_MAX_PAGE_SIZE records, so a
+                        // larger Limit is collected by following the cursor (starting_after)
+                        let remaining = limit;
+                        let cursor: string | undefined;
 
-                        // REST API returns data in format: { data: { [resourcePlural]: [...records] } }
-                        const records = response.data?.[pluralName];
-                        
-                        if (!records) {
-                            // No records found - return empty array
-                            continue;
-                        }
+                        do {
+                            const queryParts = [...baseQueryParts];
+                            if (limit) {
+                                queryParts.unshift(`limit=${Math.min(remaining, TWENTY_REST_MAX_PAGE_SIZE)}`);
+                            }
+                            if (cursor) {
+                                queryParts.push(`starting_after=${encodeURIComponent(cursor)}`);
+                            }
 
-                        // Handle both array response and paginated response
-                        const recordsArray = Array.isArray(records) ? records : records.edges?.map((edge: any) => edge.node) || [];
+                            const restPath = `/${pluralName}${queryParts.length > 0 ? '?' + queryParts.join('&') : ''}`;
 
-                        // Transform each record to workflow record
-                        for (const record of recordsArray) {
-                            returnData.push({
-                                json: record,
-                                pairedItem: { item: i },
-                            });
-                        }
+                            const response: any = await twentyRestApiRequest.call(
+                                this,
+                                'GET',
+                                restPath,
+                            );
+
+                            // REST API returns: { data: { [resourcePlural]: [...records] }, pageInfo, totalCount }
+                            const records = response.data?.[pluralName];
+
+                            if (!records) {
+                                // No records found
+                                break;
+                            }
+
+                            // Handle both array response and paginated response
+                            const recordsArray: any[] = Array.isArray(records) ? records : records.edges?.map((edge: any) => edge.node) || [];
+
+                            // Transform each record to workflow record (never more than the requested Limit)
+                            for (const record of limit ? recordsArray.slice(0, remaining) : recordsArray) {
+                                returnData.push({
+                                    json: record,
+                                    pairedItem: { item: i },
+                                });
+                            }
+
+                            remaining -= recordsArray.length;
+                            const pageInfo = response.pageInfo ?? response.data?.pageInfo;
+                            cursor =
+                                recordsArray.length > 0 && pageInfo?.hasNextPage === true && typeof pageInfo.endCursor === 'string'
+                                    ? pageInfo.endCursor
+                                    : undefined;
+                        } while (limit && remaining > 0 && cursor);
                     } catch (error) {
                         // If REST API fails, provide helpful error message
                         if (error.message.includes('not found')) {

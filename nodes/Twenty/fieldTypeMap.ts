@@ -7,13 +7,14 @@
  * Source of truth: the FieldMetadataType enum in
  * packages/twenty-shared/src/types/FieldMetadataType.ts (twentyhq/twenty).
  * Every enum value has an explicit entry so nothing silently falls through to
- * the default. Verified against the Twenty v2.49.0 enum (25 values).
+ * the default. Verified against the Twenty v2.49.0 and v2.57.1 enums (the same
+ * 25 values).
  *
  * The map also contains the GraphQL introspection composite type names
  * (PascalCase), which the data schema reports instead of the enum values.
  *
  * Categories with dedicated inputs: fullName, link, currency, address, emails,
- * phones, select, multiSelect, boolean, simple. The category 'relation'
+ * phones, richText, select, multiSelect, boolean, simple. The category 'relation'
  * renders no value input and writes nothing; it is used for composite or
  * read-only types that cannot be written with a plain value.
  *
@@ -41,7 +42,8 @@ export const TWENTY_TYPE_TO_N8N_TYPE: Record<string, string> = {
 	RATING: 'simple',
 	RAW_JSON: 'simple',
 	RELATION: 'relation',
-	RICH_TEXT: 'simple',
+	RICH_TEXT: 'richText', // Composite {markdown, tiptap, blocknote}; see getRichTextMetadataTypes
+	RICH_TEXT_V2: 'richText', // Name of the same composite before Twenty v1.19
 	SELECT: 'select',
 	TEXT: 'simple',
 	TS_VECTOR: 'relation', // Read-only search vector
@@ -54,6 +56,8 @@ export const TWENTY_TYPE_TO_N8N_TYPE: Record<string, string> = {
 	Address: 'address',
 	Emails: 'emails',
 	Phones: 'phones',
+	RichText: 'richText',
+	RichTextV2: 'richText',
 	Actor: 'relation',
 };
 
@@ -69,12 +73,33 @@ export function mapTwentyTypeToN8nType(twentyType: string): string {
 }
 
 /**
+ * Returns the metadata field types that are the rich text composite
+ * (`{ markdown, ... }`) on the connected server.
+ *
+ * Twenty renamed RICH_TEXT_V2 to RICH_TEXT (twentyhq/twenty #18628). On servers
+ * from before the rename, RICH_TEXT_V2 is the composite and RICH_TEXT is a
+ * deprecated plain text type, so RICH_TEXT only counts as the composite when
+ * the schema has no RICH_TEXT_V2 field.
+ *
+ * @param {Array<{ fields: Array<{ type: string }> }>} objects Objects of the schema (metadata).
+ * @returns {Set<string>} Metadata type names of the rich text composite.
+ */
+export function getRichTextMetadataTypes(
+	objects: Array<{ fields: Array<{ type: string }> }>,
+): Set<string> {
+	const hasRichTextV2 = objects.some((object) =>
+		object.fields.some((field) => field.type === 'RICH_TEXT_V2'),
+	);
+	return new Set<string>([hasRichTextV2 ? 'RICH_TEXT_V2' : 'RICH_TEXT']);
+}
+
+/**
  * Filterable sub-fields of composite types, used by the Upsert "Match Field"
  * dropdowns. Twenty's REST filter matches composite sub-field paths
  * (e.g. `emails.primaryEmail[eq]:"..."`) and rejects a filter on the whole
  * composite object. Keys are n8n input categories from TWENTY_TYPE_TO_N8N_TYPE.
  *
- * Sub-field names verified against the Twenty v2.49.0 composite type
+ * Sub-field names verified against the Twenty v2.49.0 and v2.57.1 composite type
  * definitions in packages/twenty-shared/src/types/composite-types/*.ts.
  * Ported from xangelix/n8n-nodes-twenty-crm-next (2.1.5).
  */
@@ -109,6 +134,7 @@ export const NON_MATCHABLE_FIELD_TYPES = new Set<string>([
 	'RAW_JSON',
 	'ARRAY',
 	'RICH_TEXT',
+	'RICH_TEXT_V2',
 	'RichText',
 	'RichTextV2',
 ]);

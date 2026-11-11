@@ -10,7 +10,7 @@
  */
 export interface IFieldData {
 	fieldName: string;
-	fieldType?: string; // 'simple', 'fullName', 'link', 'currency', 'address', 'emails', 'phones', 'select', 'multiSelect', 'boolean'
+	fieldType?: string; // 'simple', 'fullName', 'link', 'currency', 'address', 'emails', 'phones', 'richText', 'select', 'multiSelect', 'boolean'
 	fieldValue?: any;
 	// FullName fields
 	firstName?: string;
@@ -42,6 +42,39 @@ export interface IFieldData {
 	fieldMultiSelectValue?: string[];
 	// Boolean field
 	fieldBooleanValue?: boolean;
+	// Rich text field (Markdown)
+	fieldMarkdownValue?: string;
+}
+
+/**
+ * Options for transformFieldsData
+ */
+export interface ITransformFieldsOptions {
+	/**
+	 * Names of the object's rich text fields (e.g. `bodyV2` on Note). A value
+	 * given for one of them through the plain "Value" input or a bulk JSON
+	 * payload is wrapped as `{ markdown }`, which is the shape Twenty requires.
+	 */
+	richTextFieldNames?: ReadonlySet<string>;
+}
+
+/**
+ * Converts a user-supplied value to Twenty's rich text input.
+ * Twenty rejects a plain string for a rich text field: it expects an object
+ * with `markdown` (or `tiptap` / `blocknote`) and derives the other formats.
+ *
+ * @param value A Markdown string, or an already-shaped rich text object
+ * @returns The rich text input, or undefined when there is nothing to set
+ */
+function toRichTextValue(value: unknown): Record<string, unknown> | undefined {
+	if (value === undefined || value === null || value === '') {
+		return undefined;
+	}
+	if (typeof value === 'object' && !Array.isArray(value)) {
+		// Already { markdown } / { tiptap } / { blocknote }: pass through
+		return value as Record<string, unknown>;
+	}
+	return { markdown: String(value) };
 }
 
 /**
@@ -50,9 +83,14 @@ export interface IFieldData {
  * 
  * @param fields Array of field data from n8n parameters
  * @param resource The resource type (person, company, etc.) - used for resource-specific transformations (deprecated, use fieldType instead)
+ * @param options Additional options (rich text field names of the object)
  * @returns Object with properly structured field data for GraphQL
  */
-export function transformFieldsData(fields: IFieldData[], resource?: string): Record<string, any> {
+export function transformFieldsData(
+	fields: IFieldData[],
+	resource?: string,
+	options?: ITransformFieldsOptions,
+): Record<string, any> {
 	const result: Record<string, any> = {};
 
 	for (const field of fields) {
@@ -171,11 +209,28 @@ export function transformFieldsData(fields: IFieldData[], resource?: string): Re
 				}
 				break;
 
+			case 'richText': {
+				// Rich text fields - Markdown wrapped as { markdown }
+				const richText = toRichTextValue(
+					field.fieldMarkdownValue !== undefined && field.fieldMarkdownValue !== ''
+						? field.fieldMarkdownValue
+						: field.fieldValue,
+				);
+				if (richText !== undefined) {
+					result[actualFieldName] = richText;
+				}
+				break;
+			}
+
 			case 'simple':
 			default:
 				// Simple fields - use fieldValue directly
 				if (field.fieldValue !== undefined && field.fieldValue !== '') {
-					result[actualFieldName] = field.fieldValue;
+					// Rich text set through the plain input (workflows saved before the
+					// richText category existed) or a bulk JSON payload
+					result[actualFieldName] = options?.richTextFieldNames?.has(actualFieldName)
+						? toRichTextValue(field.fieldValue)
+						: field.fieldValue;
 				}
 				break;
 		}
